@@ -1,0 +1,23 @@
+# Artefacts de build
+build/
+.state/
+
+# Environnement LocalStack
+rep_localstack/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editeurs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
