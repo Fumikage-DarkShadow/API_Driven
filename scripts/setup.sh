@@ -49,7 +49,26 @@ command -v zip      >/dev/null || fail "zip introuvable. Installe-le : sudo apt-
 curl -sf http://localhost:4566/_localstack/health >/dev/null \
     || fail "LocalStack ne repond pas sur localhost:4566. Demarre-le : localstack start -d"
 
-# === 1. Lancer l'instance EC2 ==========================================
+# === 1. Verifier / creer une AMI fictive ===============================
+# LocalStack verifie l'existence des AMI. On en cree une si aucune n'existe.
+EXISTING_AMI=$(awslocal ec2 describe-images --owners self \
+    --query 'Images[0].ImageId' --output text 2>/dev/null || echo "None")
+
+if [ "${EXISTING_AMI}" = "None" ] || [ -z "${EXISTING_AMI}" ]; then
+    log "Aucune AMI trouvee, enregistrement d'une AMI fictive..."
+    AMI_ID=$(awslocal ec2 register-image \
+        --name "atelier-ami-$(date +%s)" \
+        --description "AMI fictive pour atelier API-Driven" \
+        --root-device-name "/dev/sda1" \
+        --architecture x86_64 \
+        --query 'ImageId' --output text)
+    ok "AMI creee : ${AMI_ID}"
+else
+    AMI_ID="${EXISTING_AMI}"
+    ok "AMI existante reutilisee : ${AMI_ID}"
+fi
+
+# === 2. Lancer l'instance EC2 ==========================================
 log "Lancement d'une instance EC2 (AMI=${AMI_ID}, type=${INSTANCE_TYPE})..."
 INSTANCE_ID=$(awslocal ec2 run-instances \
     --image-id "${AMI_ID}" \
