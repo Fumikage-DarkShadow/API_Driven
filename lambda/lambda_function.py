@@ -1,8 +1,15 @@
 """
-Fonction Lambda pour piloter une instance EC2 (start / stop) via API Gateway.
+Fonction Lambda pour piloter une instance EC2 (start / stop / status) via API Gateway.
 
-Recoit un event API Gateway (v1 REST ou v2 HTTP), determine l'action a faire
-(/start, /stop, /status) et appelle EC2 via boto3.
+L'instance EC2 cible est identifiee par un TAG (ATELIER_TAG), pas par un ID fixe.
+Cela permet de gerer le cas ou LocalStack auto-termine l'instance : la Lambda
+peut alors en recreer une fraiche en gardant la meme identite logique.
+
+Variables d'environnement attendues :
+  - ATELIER_TAG        : tag Name de l'instance a piloter (ex : "atelier-ec2")
+  - AMI_ID             : AMI a utiliser pour creer une nouvelle instance
+  - INSTANCE_TYPE      : type d'instance (ex : "t2.micro")
+  - LOCALSTACK_HOSTNAME (auto-injecte par LocalStack)
 """
 
 import json
@@ -12,17 +19,14 @@ import traceback
 
 
 def _log(msg):
-    """Force le flush pour que CloudWatch capte les logs."""
     print(msg, flush=True)
     sys.stdout.flush()
 
 
 def _client():
-    """Cree un client EC2 boto3 qui marche sur LocalStack ou AWS reel."""
     import boto3
 
     endpoint = os.getenv("AWS_ENDPOINT_URL")
-
     if not endpoint:
         localstack_host = os.getenv("LOCALSTACK_HOSTNAME")
         if localstack_host:
@@ -51,77 +55,154 @@ def _response(status_code, body):
 
 
 def _extract_action(event):
-    """Extrait l'action /start /stop /status du payload, quel que soit le format."""
-    # Format API Gateway v1 REST
-    path = event.get("path")
-    # Format API Gateway v2 HTTP
-    if not path:
-        path = event.get("rawPath")
-    # Format requestContext (v2)
-    if not path:
-        rc = event.get("requestContext") or {}
-        path = rc.get("http", {}).get("path") if isinstance(rc.get("http"), dict) else None
-    # Format direct invocation
-    if not path:
-        path = event.get("action") or ""
+    path = (
+        event.get("path")
+        or event.get("rawPath")
+        or (event.get("requestContext", {}).get("http", {}) or {}).get("path")
+        or event.get("action")
+        or ""
+    )
+    return path.strip("/").lower()
 
-    return (path or "").strip("/").lower()
+
+def _find_instance(ec2, tag_value):
+    """Trouve l'instance la plus recente portant le tag Name=<tag_value>.
+
+    Ignore les instances terminees ou en cours de terminaison.
+    Retourne (instance_dict, state_name) ou (None, None).
+    """
+    resp = ec2.describe_instances(Filters=[
+        {"Name": "tag:Name", "Values": [tag_value]},
+    ])
+    candidates = []
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            state = inst.get("State", {}).get("Name", "")
+            if state in ("terminated", "shutting-down"):
+                continue
+            candidates.append(inst)
+
+    if not candidates:
+        return None, None
+
+    # Plus recente en premier
+    candidates.sort(key=lambda i: i.get("LaunchTime") or "", reverse=True)
+    inst = candidates[0]
+    return inst, inst["State"]["Name"]
+
+
+def _create_instance(ec2, tag_value, ami_id, instance_type):
+    """Cree une instance EC2 avec le tag Name=<tag_value>."""
+    _log(f"[create] AMI={ami_id} type={instance_type} tag={tag_value}")
+    resp = ec2.run_instances(
+        ImageId=ami_id,
+        InstanceType=instance_type,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            "ResourceType": "instance",
+            "Tags": [{"Key": "Name", "Value": tag_value}],
+        }],
+    )
+    return resp["Instances"][0]
 
 
 def handler(event, context):
     _log("===== INVOCATION =====")
     _log(f"EVENT: {json.dumps(event, default=str)}")
 
-    try:
-        instance_id = os.getenv("INSTANCE_ID")
-        if not instance_id:
-            _log("[fatal] INSTANCE_ID non defini")
-            return _response(500, {"error": "INSTANCE_ID non defini cote Lambda"})
+    tag_value = os.getenv("ATELIER_TAG", "atelier-ec2")
+    ami_id = os.getenv("AMI_ID")
+    instance_type = os.getenv("INSTANCE_TYPE", "t2.micro")
 
+    if not ami_id:
+        return _response(500, {"error": "AMI_ID non defini cote Lambda"})
+
+    try:
         action = _extract_action(event)
-        _log(f"[parse] action extraite = '{action}'")
+        _log(f"[parse] action='{action}', tag='{tag_value}'")
 
         ec2 = _client()
+        inst, state = _find_instance(ec2, tag_value)
+
+        if action == "status":
+            if inst is None:
+                return _response(200, {
+                    "action": "status",
+                    "state": "absent",
+                    "message": "Aucune instance active. Lance /start pour en creer une.",
+                })
+            return _response(200, {
+                "action": "status",
+                "instance_id": inst["InstanceId"],
+                "state": state,
+                "instance_type": inst.get("InstanceType"),
+                "launch_time": inst.get("LaunchTime"),
+            })
 
         if action == "start":
-            resp = ec2.start_instances(InstanceIds=[instance_id])
+            # Cas 1 : aucune instance active -> on en cree une
+            if inst is None:
+                new_inst = _create_instance(ec2, tag_value, ami_id, instance_type)
+                return _response(200, {
+                    "action": "start",
+                    "instance_id": new_inst["InstanceId"],
+                    "previous_state": "absent",
+                    "current_state": new_inst["State"]["Name"],
+                    "message": "Instance creee",
+                })
+
+            # Cas 2 : instance deja en cours -> rien a faire
+            if state in ("running", "pending"):
+                return _response(200, {
+                    "action": "start",
+                    "instance_id": inst["InstanceId"],
+                    "previous_state": state,
+                    "current_state": state,
+                    "message": "Instance deja active",
+                })
+
+            # Cas 3 : instance arretee -> on la redemarre
+            resp = ec2.start_instances(InstanceIds=[inst["InstanceId"]])
             return _response(200, {
                 "action": "start",
-                "instance_id": instance_id,
+                "instance_id": inst["InstanceId"],
                 "previous_state": resp["StartingInstances"][0]["PreviousState"]["Name"],
                 "current_state": resp["StartingInstances"][0]["CurrentState"]["Name"],
             })
 
         if action == "stop":
-            resp = ec2.stop_instances(InstanceIds=[instance_id])
+            if inst is None:
+                return _response(404, {
+                    "action": "stop",
+                    "error": "Aucune instance active a arreter",
+                })
+
+            if state in ("stopped", "stopping"):
+                return _response(200, {
+                    "action": "stop",
+                    "instance_id": inst["InstanceId"],
+                    "previous_state": state,
+                    "current_state": state,
+                    "message": "Instance deja arretee",
+                })
+
+            resp = ec2.stop_instances(InstanceIds=[inst["InstanceId"]])
             return _response(200, {
                 "action": "stop",
-                "instance_id": instance_id,
+                "instance_id": inst["InstanceId"],
                 "previous_state": resp["StoppingInstances"][0]["PreviousState"]["Name"],
                 "current_state": resp["StoppingInstances"][0]["CurrentState"]["Name"],
             })
 
-        if action == "status":
-            resp = ec2.describe_instances(InstanceIds=[instance_id])
-            inst = resp["Reservations"][0]["Instances"][0]
-            return _response(200, {
-                "action": "status",
-                "instance_id": instance_id,
-                "state": inst["State"]["Name"],
-                "instance_type": inst.get("InstanceType"),
-                "launch_time": inst.get("LaunchTime"),
-            })
-
-        _log(f"[warn] action inconnue : '{action}'")
         return _response(400, {
             "error": "Action inconnue",
-            "received_action": action,
-            "received_event_keys": list(event.keys()),
+            "received": action,
             "actions_supportees": ["start", "stop", "status"],
         })
 
     except Exception as e:
-        _log(f"[fatal] Exception : {type(e).__name__}: {e}")
+        _log(f"[fatal] {type(e).__name__}: {e}")
         _log(traceback.format_exc())
         return _response(500, {
             "error": "Echec interne Lambda",
