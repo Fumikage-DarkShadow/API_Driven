@@ -1,31 +1,26 @@
 """
 Fonction Lambda pour piloter une instance EC2 (start / stop) via API Gateway.
 
-Cette Lambda est invoquee par API Gateway. Elle recoit un event au format
-"proxy integration" qui contient le chemin (ex: /start, /stop, /status).
-
-L'instance EC2 cible est identifiee par la variable d'environnement
-INSTANCE_ID (definie au moment du deploiement de la Lambda).
-
-Boto3 est utilise pour parler a EC2. En production AWS, boto3 pointe sur
-l'API publique d'AWS. En local (LocalStack), on lui dit de pointer sur
-http://localhost:4566 via la variable d'environnement AWS_ENDPOINT_URL ou
-en lui passant endpoint_url=... explicitement.
+Recoit un event API Gateway (v1 REST ou v2 HTTP), determine l'action a faire
+(/start, /stop, /status) et appelle EC2 via boto3.
 """
 
 import json
 import os
-import boto3
+import sys
+import traceback
+
+
+def _log(msg):
+    """Force le flush pour que CloudWatch capte les logs."""
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 def _client():
-    """Cree un client EC2 boto3 qui marche aussi bien sur LocalStack qu'AWS reel.
+    """Cree un client EC2 boto3 qui marche sur LocalStack ou AWS reel."""
+    import boto3
 
-    Quand la Lambda tourne dans LocalStack, elle est dans un container Docker
-    isole. Pour parler a LocalStack depuis ce container, on utilise la variable
-    d'environnement LOCALSTACK_HOSTNAME auto-injectee par LocalStack, qui pointe
-    vers le service LocalStack sur le reseau Docker.
-    """
     endpoint = os.getenv("AWS_ENDPOINT_URL")
 
     if not endpoint:
@@ -33,6 +28,8 @@ def _client():
         if localstack_host:
             edge_port = os.getenv("EDGE_PORT", "4566")
             endpoint = f"http://{localstack_host}:{edge_port}"
+
+    _log(f"[ec2-client] endpoint={endpoint}")
 
     if endpoint:
         return boto3.client(
@@ -46,7 +43,6 @@ def _client():
 
 
 def _response(status_code, body):
-    """Construit une reponse HTTP au format attendu par API Gateway proxy."""
     return {
         "statusCode": status_code,
         "headers": {"Content-Type": "application/json"},
@@ -54,19 +50,39 @@ def _response(status_code, body):
     }
 
 
+def _extract_action(event):
+    """Extrait l'action /start /stop /status du payload, quel que soit le format."""
+    # Format API Gateway v1 REST
+    path = event.get("path")
+    # Format API Gateway v2 HTTP
+    if not path:
+        path = event.get("rawPath")
+    # Format requestContext (v2)
+    if not path:
+        rc = event.get("requestContext") or {}
+        path = rc.get("http", {}).get("path") if isinstance(rc.get("http"), dict) else None
+    # Format direct invocation
+    if not path:
+        path = event.get("action") or ""
+
+    return (path or "").strip("/").lower()
+
+
 def handler(event, context):
-    instance_id = os.getenv("INSTANCE_ID")
-    if not instance_id:
-        return _response(500, {"error": "INSTANCE_ID non defini cote Lambda"})
-
-    # Recupere le chemin appele (/start, /stop, /status)
-    # API Gateway peut envoyer ca dans path ou dans rawPath selon la version.
-    path = event.get("path") or event.get("rawPath") or ""
-    action = path.strip("/").lower()
-
-    ec2 = _client()
+    _log("===== INVOCATION =====")
+    _log(f"EVENT: {json.dumps(event, default=str)}")
 
     try:
+        instance_id = os.getenv("INSTANCE_ID")
+        if not instance_id:
+            _log("[fatal] INSTANCE_ID non defini")
+            return _response(500, {"error": "INSTANCE_ID non defini cote Lambda"})
+
+        action = _extract_action(event)
+        _log(f"[parse] action extraite = '{action}'")
+
+        ec2 = _client()
+
         if action == "start":
             resp = ec2.start_instances(InstanceIds=[instance_id])
             return _response(200, {
@@ -96,15 +112,19 @@ def handler(event, context):
                 "launch_time": inst.get("LaunchTime"),
             })
 
+        _log(f"[warn] action inconnue : '{action}'")
         return _response(400, {
             "error": "Action inconnue",
-            "received_path": path,
-            "actions_supportees": ["/start", "/stop", "/status"],
+            "received_action": action,
+            "received_event_keys": list(event.keys()),
+            "actions_supportees": ["start", "stop", "status"],
         })
 
     except Exception as e:
+        _log(f"[fatal] Exception : {type(e).__name__}: {e}")
+        _log(traceback.format_exc())
         return _response(500, {
-            "error": "Echec de l'action EC2",
-            "action": action,
+            "error": "Echec interne Lambda",
+            "type": type(e).__name__,
             "detail": str(e),
         })
