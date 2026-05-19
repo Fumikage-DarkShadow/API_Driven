@@ -96,7 +96,7 @@ if awslocal lambda get-function --function-name "${LAMBDA_NAME}" >/dev/null 2>&1
     awslocal lambda wait function-updated --function-name "${LAMBDA_NAME}"
     awslocal lambda update-function-configuration \
         --function-name "${LAMBDA_NAME}" \
-        --environment "Variables={INSTANCE_ID=${INSTANCE_ID},AWS_ENDPOINT_URL=http://localhost.localstack.cloud:4566}" >/dev/null
+        --environment "Variables={INSTANCE_ID=${INSTANCE_ID}}" >/dev/null
 else
     log "Creation de la Lambda ${LAMBDA_NAME}..."
     awslocal lambda create-function \
@@ -105,7 +105,7 @@ else
         --role arn:aws:iam::000000000000:role/lambda-role \
         --handler lambda_function.handler \
         --zip-file "fileb://${ZIP_FILE}" \
-        --environment "Variables={INSTANCE_ID=${INSTANCE_ID},AWS_ENDPOINT_URL=http://localhost.localstack.cloud:4566}" >/dev/null
+        --environment "Variables={INSTANCE_ID=${INSTANCE_ID}}" >/dev/null
 fi
 ok "Lambda prete : ${LAMBDA_NAME} (INSTANCE_ID=${INSTANCE_ID})"
 

@@ -19,8 +19,21 @@ import boto3
 
 
 def _client():
-    """Cree un client EC2 boto3 qui marche aussi bien sur LocalStack qu'AWS reel."""
-    endpoint = os.getenv("AWS_ENDPOINT_URL") or os.getenv("LOCALSTACK_HOSTNAME_URL")
+    """Cree un client EC2 boto3 qui marche aussi bien sur LocalStack qu'AWS reel.
+
+    Quand la Lambda tourne dans LocalStack, elle est dans un container Docker
+    isole. Pour parler a LocalStack depuis ce container, on utilise la variable
+    d'environnement LOCALSTACK_HOSTNAME auto-injectee par LocalStack, qui pointe
+    vers le service LocalStack sur le reseau Docker.
+    """
+    endpoint = os.getenv("AWS_ENDPOINT_URL")
+
+    if not endpoint:
+        localstack_host = os.getenv("LOCALSTACK_HOSTNAME")
+        if localstack_host:
+            edge_port = os.getenv("EDGE_PORT", "4566")
+            endpoint = f"http://{localstack_host}:{edge_port}"
+
     if endpoint:
         return boto3.client(
             "ec2",
